@@ -26,6 +26,13 @@ from .renderer import (
     render_mip_projection,
     normalize_gaussian_positions,
     denormalize_gaussian_positions,
+    # MIP and Alpha Blending
+    render_mip_orthographic,
+    render_alpha_blending_orthographic,
+    render_gaussians_orthographic,
+    render_sum_orthographic,
+    render_all_views,
+    render_from_checkpoint,
 )
 
 __all__ = [
@@ -59,4 +66,11 @@ __all__ = [
     'render_mip_projection',
     'normalize_gaussian_positions',
     'denormalize_gaussian_positions',
+    # MIP and Alpha Blending
+    'render_mip_orthographic',
+    'render_alpha_blending_orthographic',
+    'render_gaussians_orthographic',
+    'render_sum_orthographic',
+    'render_all_views',
+    'render_from_checkpoint',
 ]

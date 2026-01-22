@@ -421,6 +421,489 @@ def render_multiple_views(
 # MIP (Maximum Intensity Projection) Rendering
 # =============================================================================
 
+def quaternion_to_rotation_matrix(q: torch.Tensor) -> torch.Tensor:
+    """
+    Convert quaternions to rotation matrices.
+    
+    Args:
+        q: [N, 4] quaternions (w, x, y, z)
+    
+    Returns:
+        [N, 3, 3] rotation matrices
+    """
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    R = torch.zeros(q.shape[0], 3, 3, device=q.device)
+    R[:, 0, 0] = 1 - 2*(y*y + z*z)
+    R[:, 0, 1] = 2*(x*y - w*z)
+    R[:, 0, 2] = 2*(x*z + w*y)
+    R[:, 1, 0] = 2*(x*y + w*z)
+    R[:, 1, 1] = 1 - 2*(x*x + z*z)
+    R[:, 1, 2] = 2*(y*z - w*x)
+    R[:, 2, 0] = 2*(x*z - w*y)
+    R[:, 2, 1] = 2*(y*z + w*x)
+    R[:, 2, 2] = 1 - 2*(x*x + y*y)
+    return R
+
+
+def compute_2d_covariance(
+    cov_3d: torch.Tensor,
+    axis_u: int,
+    axis_v: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract 2D marginal covariance from 3D covariance for orthographic projection.
+    
+    Args:
+        cov_3d: [N, 3, 3] 3D covariance matrices
+        axis_u: First projection axis
+        axis_v: Second projection axis
+    
+    Returns:
+        (cov_2d, inv_cov_2d): 2D covariance and its inverse
+    """
+    N = cov_3d.shape[0]
+    cov_2d = torch.zeros(N, 2, 2, device=cov_3d.device)
+    cov_2d[:, 0, 0] = cov_3d[:, axis_u, axis_u]
+    cov_2d[:, 0, 1] = cov_3d[:, axis_u, axis_v]
+    cov_2d[:, 1, 0] = cov_3d[:, axis_v, axis_u]
+    cov_2d[:, 1, 1] = cov_3d[:, axis_v, axis_v]
+    
+    # Inverse 2D covariance
+    det = cov_2d[:, 0, 0] * cov_2d[:, 1, 1] - cov_2d[:, 0, 1] * cov_2d[:, 1, 0]
+    det = det.clamp(min=1e-10)
+    
+    inv_cov_2d = torch.zeros_like(cov_2d)
+    inv_cov_2d[:, 0, 0] = cov_2d[:, 1, 1] / det
+    inv_cov_2d[:, 1, 1] = cov_2d[:, 0, 0] / det
+    inv_cov_2d[:, 0, 1] = -cov_2d[:, 0, 1] / det
+    inv_cov_2d[:, 1, 0] = -cov_2d[:, 1, 0] / det
+    
+    return cov_2d, inv_cov_2d
+
+
+def render_mip_orthographic(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    proj_axis: int,
+    img_h: int,
+    img_w: int,
+    scale_factor: float = 4.0
+) -> torch.Tensor:
+    """
+    Render Maximum Intensity Projection with orthographic projection.
+    
+    MIP takes the maximum Gaussian contribution along each ray.
+    
+    Args:
+        xyz: [N, 3] Gaussian positions in [0, 1] range
+        intensity: [N] Gaussian intensities
+        scaling: [N, 3] Gaussian scales
+        rotation: [N, 4] Gaussian rotations (quaternions)
+        proj_axis: Projection axis (0=Z top-down, 1=Y front, 2=X side)
+        img_h: Output image height
+        img_w: Output image width
+        scale_factor: Bounding box multiplier for Gaussians
+    
+    Returns:
+        [H, W] MIP rendered image
+    """
+    N = xyz.shape[0]
+    
+    # Determine projection axes
+    if proj_axis == 0:  # Looking along Z -> project to YX plane
+        axis_u, axis_v = 1, 2
+    elif proj_axis == 1:  # Looking along Y -> project to ZX plane
+        axis_u, axis_v = 0, 2
+    else:  # Looking along X -> project to ZY plane
+        axis_u, axis_v = 0, 1
+    
+    # Build 3D covariance
+    R = quaternion_to_rotation_matrix(rotation)
+    S_diag = torch.diag_embed(scaling)
+    cov_3d = R @ S_diag @ S_diag @ R.transpose(1, 2)
+    
+    # Get 2D covariance
+    _, inv_cov_2d = compute_2d_covariance(cov_3d, axis_u, axis_v)
+    
+    # Move to numpy for splatting
+    pos_2d = torch.stack([xyz[:, axis_u], xyz[:, axis_v]], dim=1).cpu().numpy()
+    inv_cov_np = inv_cov_2d.cpu().numpy()
+    intensity_np = intensity.cpu().numpy()
+    scaling_np = scaling.cpu().numpy()
+    
+    # Grid coordinates
+    u_coords = np.linspace(0, 1, img_h)
+    v_coords = np.linspace(0, 1, img_w)
+    
+    # Output image
+    image = np.zeros((img_h, img_w), dtype=np.float32)
+    
+    for g_idx in range(N):
+        pos = pos_2d[g_idx]
+        inv_c = inv_cov_np[g_idx]
+        inten = intensity_np[g_idx]
+        
+        if inten < 0.01:
+            continue
+        
+        # Bounding box
+        s = scaling_np[g_idx]
+        max_scale = max(s[axis_u], s[axis_v]) * scale_factor
+        
+        u_min = max(0, int((pos[0] - max_scale) * img_h))
+        u_max = min(img_h, int((pos[0] + max_scale) * img_h) + 1)
+        v_min = max(0, int((pos[1] - max_scale) * img_w))
+        v_max = min(img_w, int((pos[1] + max_scale) * img_w) + 1)
+        
+        if u_min >= u_max or v_min >= v_max:
+            continue
+        
+        uu, vv = np.meshgrid(u_coords[u_min:u_max], v_coords[v_min:v_max], indexing='ij')
+        
+        du = uu - pos[0]
+        dv = vv - pos[1]
+        
+        mahal_sq = (inv_c[0, 0] * du * du + 
+                   (inv_c[0, 1] + inv_c[1, 0]) * du * dv + 
+                    inv_c[1, 1] * dv * dv)
+        
+        gauss = np.exp(-0.5 * np.clip(mahal_sq, 0, 20)) * inten
+        
+        # MIP: take maximum
+        image[u_min:u_max, v_min:v_max] = np.maximum(
+            image[u_min:u_max, v_min:v_max], gauss)
+    
+    return torch.from_numpy(image)
+
+
+def render_alpha_blending_orthographic(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    proj_axis: int,
+    img_h: int,
+    img_w: int,
+    scale_factor: float = 4.0
+) -> torch.Tensor:
+    """
+    Render with alpha blending (front-to-back compositing) and orthographic projection.
+    
+    Gaussians are sorted by depth and composited using the over operator.
+    
+    Args:
+        xyz: [N, 3] Gaussian positions in [0, 1] range
+        intensity: [N] Gaussian intensities (used as both opacity and color)
+        scaling: [N, 3] Gaussian scales
+        rotation: [N, 4] Gaussian rotations (quaternions)
+        proj_axis: Projection axis (0=Z top-down, 1=Y front, 2=X side)
+        img_h: Output image height
+        img_w: Output image width
+        scale_factor: Bounding box multiplier for Gaussians
+    
+    Returns:
+        [H, W] alpha-blended rendered image
+    """
+    N = xyz.shape[0]
+    
+    # Determine projection axes
+    if proj_axis == 0:  # Looking along Z
+        axis_u, axis_v, axis_depth = 1, 2, 0
+    elif proj_axis == 1:  # Looking along Y
+        axis_u, axis_v, axis_depth = 0, 2, 1
+    else:  # Looking along X
+        axis_u, axis_v, axis_depth = 0, 1, 2
+    
+    # Sort by depth (back to front for over compositing)
+    depth = xyz[:, axis_depth]
+    sorted_idx = torch.argsort(depth, descending=True)
+    
+    xyz_sorted = xyz[sorted_idx]
+    intensity_sorted = intensity[sorted_idx]
+    scaling_sorted = scaling[sorted_idx]
+    rotation_sorted = rotation[sorted_idx]
+    
+    # Build 3D covariance
+    R = quaternion_to_rotation_matrix(rotation_sorted)
+    S_diag = torch.diag_embed(scaling_sorted)
+    cov_3d = R @ S_diag @ S_diag @ R.transpose(1, 2)
+    
+    # Get 2D covariance
+    _, inv_cov_2d = compute_2d_covariance(cov_3d, axis_u, axis_v)
+    
+    # Move to numpy
+    pos_2d = torch.stack([xyz_sorted[:, axis_u], xyz_sorted[:, axis_v]], dim=1).cpu().numpy()
+    inv_cov_np = inv_cov_2d.cpu().numpy()
+    intensity_np = intensity_sorted.cpu().numpy()
+    scaling_np = scaling_sorted.cpu().numpy()
+    
+    # Grid coordinates
+    u_coords = np.linspace(0, 1, img_h)
+    v_coords = np.linspace(0, 1, img_w)
+    
+    # Output: color and transmittance
+    color = np.zeros((img_h, img_w), dtype=np.float32)
+    transmittance = np.ones((img_h, img_w), dtype=np.float32)
+    
+    for g_idx in range(N):
+        pos = pos_2d[g_idx]
+        inv_c = inv_cov_np[g_idx]
+        inten = intensity_np[g_idx]
+        
+        if inten < 0.01:
+            continue
+        
+        # Bounding box
+        s = scaling_np[g_idx]
+        max_scale = max(s[axis_u], s[axis_v]) * scale_factor
+        
+        u_min = max(0, int((pos[0] - max_scale) * img_h))
+        u_max = min(img_h, int((pos[0] + max_scale) * img_h) + 1)
+        v_min = max(0, int((pos[1] - max_scale) * img_w))
+        v_max = min(img_w, int((pos[1] + max_scale) * img_w) + 1)
+        
+        if u_min >= u_max or v_min >= v_max:
+            continue
+        
+        uu, vv = np.meshgrid(u_coords[u_min:u_max], v_coords[v_min:v_max], indexing='ij')
+        
+        du = uu - pos[0]
+        dv = vv - pos[1]
+        
+        mahal_sq = (inv_c[0, 0] * du * du + 
+                   (inv_c[0, 1] + inv_c[1, 0]) * du * dv + 
+                    inv_c[1, 1] * dv * dv)
+        
+        # Gaussian opacity
+        alpha = np.exp(-0.5 * np.clip(mahal_sq, 0, 20)) * inten
+        alpha = np.clip(alpha, 0, 1)
+        
+        # Front-to-back compositing: C_out = C_in + T * alpha * c
+        local_T = transmittance[u_min:u_max, v_min:v_max]
+        color[u_min:u_max, v_min:v_max] += local_T * alpha * inten
+        transmittance[u_min:u_max, v_min:v_max] *= (1 - alpha)
+    
+    return torch.from_numpy(color)
+
+
+def render_gaussians_orthographic(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    proj_axis: int,
+    img_h: int,
+    img_w: int,
+    mode: str = 'alpha',
+    scale_factor: float = 4.0
+) -> torch.Tensor:
+    """
+    Render Gaussians with orthographic projection.
+    
+    Args:
+        xyz: [N, 3] Gaussian positions in [0, 1] range
+        intensity: [N] Gaussian intensities
+        scaling: [N, 3] Gaussian scales
+        rotation: [N, 4] Gaussian rotations (quaternions)
+        proj_axis: Projection axis (0=Z top-down, 1=Y front, 2=X side)
+        img_h: Output image height
+        img_w: Output image width
+        mode: Rendering mode - 'mip', 'alpha', or 'sum'
+        scale_factor: Bounding box multiplier for Gaussians
+    
+    Returns:
+        [H, W] rendered image
+    """
+    if mode == 'mip':
+        return render_mip_orthographic(
+            xyz, intensity, scaling, rotation,
+            proj_axis, img_h, img_w, scale_factor
+        )
+    elif mode == 'alpha':
+        return render_alpha_blending_orthographic(
+            xyz, intensity, scaling, rotation,
+            proj_axis, img_h, img_w, scale_factor
+        )
+    elif mode == 'sum':
+        # Simple additive blending (no depth sorting)
+        return render_sum_orthographic(
+            xyz, intensity, scaling, rotation,
+            proj_axis, img_h, img_w, scale_factor
+        )
+    else:
+        raise ValueError(f"Unknown rendering mode: {mode}. Use 'mip', 'alpha', or 'sum'")
+
+
+def render_sum_orthographic(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    proj_axis: int,
+    img_h: int,
+    img_w: int,
+    scale_factor: float = 4.0
+) -> torch.Tensor:
+    """
+    Render with simple additive blending (sum of Gaussian contributions).
+    
+    Args:
+        xyz: [N, 3] Gaussian positions in [0, 1] range
+        intensity: [N] Gaussian intensities
+        scaling: [N, 3] Gaussian scales
+        rotation: [N, 4] Gaussian rotations (quaternions)
+        proj_axis: Projection axis (0=Z, 1=Y, 2=X)
+        img_h: Output image height
+        img_w: Output image width
+        scale_factor: Bounding box multiplier for Gaussians
+    
+    Returns:
+        [H, W] summed rendered image
+    """
+    N = xyz.shape[0]
+    
+    # Determine projection axes
+    if proj_axis == 0:
+        axis_u, axis_v = 1, 2
+    elif proj_axis == 1:
+        axis_u, axis_v = 0, 2
+    else:
+        axis_u, axis_v = 0, 1
+    
+    # Build 3D covariance
+    R = quaternion_to_rotation_matrix(rotation)
+    S_diag = torch.diag_embed(scaling)
+    cov_3d = R @ S_diag @ S_diag @ R.transpose(1, 2)
+    
+    # Get 2D covariance
+    _, inv_cov_2d = compute_2d_covariance(cov_3d, axis_u, axis_v)
+    
+    # Move to numpy
+    pos_2d = torch.stack([xyz[:, axis_u], xyz[:, axis_v]], dim=1).cpu().numpy()
+    inv_cov_np = inv_cov_2d.cpu().numpy()
+    intensity_np = intensity.cpu().numpy()
+    scaling_np = scaling.cpu().numpy()
+    
+    # Grid coordinates
+    u_coords = np.linspace(0, 1, img_h)
+    v_coords = np.linspace(0, 1, img_w)
+    
+    # Output image
+    image = np.zeros((img_h, img_w), dtype=np.float32)
+    
+    for g_idx in range(N):
+        pos = pos_2d[g_idx]
+        inv_c = inv_cov_np[g_idx]
+        inten = intensity_np[g_idx]
+        
+        if inten < 0.01:
+            continue
+        
+        s = scaling_np[g_idx]
+        max_scale = max(s[axis_u], s[axis_v]) * scale_factor
+        
+        u_min = max(0, int((pos[0] - max_scale) * img_h))
+        u_max = min(img_h, int((pos[0] + max_scale) * img_h) + 1)
+        v_min = max(0, int((pos[1] - max_scale) * img_w))
+        v_max = min(img_w, int((pos[1] + max_scale) * img_w) + 1)
+        
+        if u_min >= u_max or v_min >= v_max:
+            continue
+        
+        uu, vv = np.meshgrid(u_coords[u_min:u_max], v_coords[v_min:v_max], indexing='ij')
+        
+        du = uu - pos[0]
+        dv = vv - pos[1]
+        
+        mahal_sq = (inv_c[0, 0] * du * du + 
+                   (inv_c[0, 1] + inv_c[1, 0]) * du * dv + 
+                    inv_c[1, 1] * dv * dv)
+        
+        gauss = np.exp(-0.5 * np.clip(mahal_sq, 0, 20)) * inten
+        
+        # Sum: additive blending
+        image[u_min:u_max, v_min:v_max] += gauss
+    
+    return torch.from_numpy(image)
+
+
+def render_all_views(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    scaling: torch.Tensor,
+    rotation: torch.Tensor,
+    volume_size: Tuple[int, int, int],
+    mode: str = 'alpha'
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Render all three orthographic views (top, front, side).
+    
+    Args:
+        xyz: [N, 3] Gaussian positions in [0, 1] range
+        intensity: [N] Gaussian intensities
+        scaling: [N, 3] Gaussian scales
+        rotation: [N, 4] Gaussian rotations (quaternions)
+        volume_size: (Z, Y, X) volume dimensions
+        mode: Rendering mode - 'mip', 'alpha', or 'sum'
+    
+    Returns:
+        (top_view, front_view, side_view) rendered images
+    """
+    vol_z, vol_y, vol_x = volume_size
+    
+    # Top-down view (along Z axis): Y x X
+    top = render_gaussians_orthographic(
+        xyz, intensity, scaling, rotation,
+        proj_axis=0, img_h=vol_y, img_w=vol_x, mode=mode
+    )
+    
+    # Front view (along Y axis): Z x X
+    front = render_gaussians_orthographic(
+        xyz, intensity, scaling, rotation,
+        proj_axis=1, img_h=vol_z, img_w=vol_x, mode=mode
+    )
+    
+    # Side view (along X axis): Z x Y
+    side = render_gaussians_orthographic(
+        xyz, intensity, scaling, rotation,
+        proj_axis=2, img_h=vol_z, img_w=vol_y, mode=mode
+    )
+    
+    return top, front, side
+
+
+def render_from_checkpoint(
+    checkpoint_path: str,
+    volume_size: Tuple[int, int, int],
+    mode: str = 'alpha',
+    device: str = 'cuda'
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Load a checkpoint and render all views.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        volume_size: (Z, Y, X) volume dimensions
+        mode: Rendering mode - 'mip', 'alpha', or 'sum'
+        device: Device for computation
+    
+    Returns:
+        (top_view, front_view, side_view) rendered images
+    """
+    ckpt = torch.load(checkpoint_path, weights_only=False)
+    
+    xyz = ckpt['xyz'].to(device)
+    intensity = torch.sigmoid(ckpt['intensity']).to(device).squeeze()
+    scaling = torch.exp(ckpt['scaling']).to(device)
+    rotation = torch.nn.functional.normalize(ckpt['rotation']).to(device)
+    
+    print(f"Loaded {ckpt['num_gaussians']} Gaussians from {checkpoint_path}")
+    
+    return render_all_views(xyz, intensity, scaling, rotation, volume_size, mode)
+
+
 def render_mip_projection(
     renderer: GaussianRenderer,
     gaussians,
