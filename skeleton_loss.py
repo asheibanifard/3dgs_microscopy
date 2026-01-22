@@ -5,6 +5,7 @@ Penalizes Gaussians that drift too far from the SWC skeleton.
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from swc_utils import parse_swc_file, swc_to_arrays, get_skeleton_bounds, densify_skeleton
 
